@@ -95,7 +95,8 @@ def health() -> dict:
     return {
         "status": "ok",
         "script_engine": "cursor" if settings.cursor_api_key else "mock",
-        "pipeline": "edge-tts+ffmpeg",
+        "pipeline": "openai+ffmpeg" if settings.openai_api_key else "edge-tts+ffmpeg",
+        "openai_media": bool(settings.openai_api_key),
     }
 
 

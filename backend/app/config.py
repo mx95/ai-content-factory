@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     rabbitmq_url: str = "amqp://content_factory:change_me_rabbitmq@rabbitmq:5672/"
     cursor_api_key: str = ""
     cursor_model: str = "composer-2.5"
+    openai_api_key: str = ""
     storage_dir: str = "/app/storage"
     edge_tts_voice: str = "en-US-JennyNeural"
 

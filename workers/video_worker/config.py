@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     rabbitmq_url: str = "amqp://content_factory:change_me_rabbitmq@rabbitmq:5672/"
     storage_dir: str = "/app/storage"
     edge_tts_voice: str = "en-US-JennyNeural"
+    openai_api_key: str = ""
+    openai_tts_model: str = "tts-1-hd"
+    openai_tts_voice: str = "nova"
+    openai_image_model: str = "dall-e-3"
 
 
 settings = Settings()

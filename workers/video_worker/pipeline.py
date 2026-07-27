@@ -4,9 +4,12 @@ import asyncio
 import logging
 import subprocess
 import textwrap
+from io import BytesIO
 from pathlib import Path
 
 import edge_tts
+import httpx
+from openai import OpenAI
 from PIL import Image, ImageDraw, ImageFont
 
 from config import settings, video_dir
@@ -15,6 +18,12 @@ logger = logging.getLogger(__name__)
 
 WIDTH = 1080
 HEIGHT = 1920
+
+
+def _openai_client() -> OpenAI | None:
+    if not settings.openai_api_key:
+        return None
+    return OpenAI(api_key=settings.openai_api_key)
 
 
 def _font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -53,16 +62,26 @@ def _probe_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
-async def _synthesize_scene(text: str, output: Path, voice: str) -> None:
-    try:
-        communicate = edge_tts.Communicate(text=text, voice=voice)
-        await communicate.save(str(output))
-        if output.stat().st_size > 0:
-            return
+def _synthesize_with_openai(text: str, output: Path) -> None:
+    client = _openai_client()
+    if client is None:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    with client.audio.speech.with_streaming_response.create(
+        model=settings.openai_tts_model,
+        voice=settings.openai_tts_voice,
+        input=text,
+        response_format="mp3",
+    ) as response:
+        response.stream_to_file(output)
+    if output.stat().st_size <= 0:
+        raise RuntimeError("OpenAI TTS produced empty audio")
+
+
+async def _synthesize_with_edge(text: str, output: Path, voice: str) -> None:
+    communicate = edge_tts.Communicate(text=text, voice=voice)
+    await communicate.save(str(output))
+    if output.stat().st_size <= 0:
         raise RuntimeError("edge-tts produced empty audio")
-    except Exception as exc:
-        logger.warning("edge-tts failed (%s); falling back to espeak-ng", exc)
-        _synthesize_with_espeak(text, output)
 
 
 def _synthesize_with_espeak(text: str, output: Path) -> None:
@@ -89,7 +108,23 @@ def _synthesize_with_espeak(text: str, output: Path) -> None:
     wav_path.unlink(missing_ok=True)
 
 
-def _pick_voice(language: str | None = None) -> str:
+async def _synthesize_scene(text: str, output: Path, edge_voice: str) -> None:
+    if settings.openai_api_key:
+        try:
+            await asyncio.to_thread(_synthesize_with_openai, text, output)
+            return
+        except Exception as exc:
+            logger.warning("OpenAI TTS failed (%s); trying edge-tts", exc)
+
+    try:
+        await _synthesize_with_edge(text, output, edge_voice)
+        return
+    except Exception as exc:
+        logger.warning("edge-tts failed (%s); falling back to espeak-ng", exc)
+        await asyncio.to_thread(_synthesize_with_espeak, text, output)
+
+
+def _pick_edge_voice(language: str | None = None) -> str:
     mapping = {
         "english": "en-US-JennyNeural",
         "greek": "el-GR-AthinaNeural",
@@ -101,7 +136,7 @@ def _pick_voice(language: str | None = None) -> str:
     return settings.edge_tts_voice
 
 
-def generate_scene_image(prompt: str, title: str, order: int, output: Path) -> None:
+def _generate_pillow_scene(prompt: str, title: str, order: int, output: Path) -> None:
     top = (16, 48, 41)
     bottom = (46, 194, 142)
     image = Image.new("RGB", (WIDTH, HEIGHT), top)
@@ -122,6 +157,51 @@ def generate_scene_image(prompt: str, title: str, order: int, output: Path) -> N
     draw.multiline_text((110, 760), wrapped_prompt, fill=(236, 248, 242), font=_font(44), spacing=10)
     draw.text((96, HEIGHT - 160), "AI Content Factory", fill=(204, 224, 215), font=_font(36))
     image.save(output, format="PNG")
+
+
+def _generate_openai_scene(prompt: str, title: str, output: Path) -> None:
+    client = _openai_client()
+    if client is None:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    full_prompt = (
+        "Create a vertical 9:16 cinematic still for a YouTube Shorts / TikTok fact video. "
+        "Photoreal or high-end illustrated style, dramatic lighting, no text, no watermark, "
+        "no logos, no UI chrome. "
+        f"Video title context: {title}. "
+        f"Scene: {prompt}"
+    )[:3900]
+
+    result = client.images.generate(
+        model=settings.openai_image_model,
+        prompt=full_prompt,
+        size="1024x1792",
+        quality="standard",
+        n=1,
+    )
+    item = result.data[0]
+    if getattr(item, "b64_json", None):
+        raw = BytesIO(__import__("base64").b64decode(item.b64_json))
+        image = Image.open(raw).convert("RGB")
+    elif getattr(item, "url", None):
+        response = httpx.get(item.url, timeout=120.0)
+        response.raise_for_status()
+        image = Image.open(BytesIO(response.content)).convert("RGB")
+    else:
+        raise RuntimeError("OpenAI image response missing url/b64_json")
+
+    image = image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
+    image.save(output, format="PNG")
+
+
+def generate_scene_image(prompt: str, title: str, order: int, output: Path) -> None:
+    if settings.openai_api_key:
+        try:
+            _generate_openai_scene(prompt, title, output)
+            return
+        except Exception as exc:
+            logger.warning("OpenAI image failed for scene %s (%s); using Pillow fallback", order, exc)
+    _generate_pillow_scene(prompt, title, order, output)
 
 
 def write_srt(scenes: list[dict], durations: list[float], output: Path) -> None:
@@ -217,7 +297,6 @@ def render_video(
         ]
     )
 
-    # Absolute path without spaces for the subtitles filter.
     srt_abs = srt_path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     _run_ffmpeg(
         [
@@ -253,7 +332,7 @@ def render_video(
 
 async def build_video_assets(video_id: int, title: str, scenes: list[dict], language: str | None = None) -> dict:
     out_dir = video_dir(video_id)
-    voice = _pick_voice(language)
+    edge_voice = _pick_edge_voice(language)
     ordered = sorted(scenes, key=lambda item: int(item.get("order", 0)))
     if not ordered:
         raise RuntimeError("Script has no scenes")
@@ -272,9 +351,10 @@ async def build_video_assets(video_id: int, title: str, scenes: list[dict], lang
         audio_path = out_dir / f"scene_{order:03d}.mp3"
         image_path = out_dir / f"scene_{order:03d}.png"
         logger.info("TTS scene %s", order)
-        await _synthesize_scene(narration, audio_path, voice)
+        await _synthesize_scene(narration, audio_path, edge_voice)
         duration = max(_probe_duration(audio_path), 1.5)
-        generate_scene_image(prompt, title, order, image_path)
+        logger.info("Image scene %s", order)
+        await asyncio.to_thread(generate_scene_image, prompt, title, order, image_path)
         scene_audio_paths.append(audio_path)
         durations.append(duration)
         scene_images.append(image_path)

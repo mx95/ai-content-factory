@@ -6,7 +6,7 @@ Dockerized MVP for an automated AI video generation platform.
 
 - React dashboard: topic → script → automatic video render → preview → Approve / Reject
 - Cursor cloud agent (or mock) for scripts
-- Free/local media pipeline: edge-TTS (espeak-ng fallback) + Pillow scene images + SRT + FFmpeg 1080×1920 MP4
+- Free/local media pipeline with optional OpenAI TTS + DALL·E scene images (falls back to edge-TTS/espeak + Pillow)
 - RabbitMQ worker (`worker` service)
 - PostgreSQL, Redis, Nginx, Portainer
 - GitHub Actions CI + deploy to Hetzner on `main`
@@ -60,3 +60,20 @@ Without a key, scripts use a local mock so the pipeline still runs.
 ```env
 EDGE_TTS_VOICE=en-US-JennyNeural
 ```
+
+## Enable OpenAI voice + AI images
+
+Used by the **worker** for narration and scene visuals (script generation still uses Cursor):
+
+```env
+OPENAI_API_KEY=sk-...
+OPENAI_TTS_MODEL=tts-1-hd
+OPENAI_TTS_VOICE=nova
+OPENAI_IMAGE_MODEL=dall-e-3
+```
+
+```bash
+docker compose up -d --build worker backend
+```
+
+Without this key, the worker falls back to edge-TTS/espeak and Pillow slides.
