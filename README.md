@@ -6,7 +6,7 @@ Dockerized MVP for an automated AI video generation platform.
 
 - React dashboard for creating video script jobs.
 - FastAPI backend with PostgreSQL persistence.
-- Optional OpenAI script generation.
+- Optional Cursor agent script generation (cloud runtime).
 - Redis and RabbitMQ ready for worker orchestration.
 - Nginx reverse proxy.
 - Portainer for container management.
@@ -54,12 +54,13 @@ cd /opt/ai-content-factory
 bash scripts/deploy.sh
 ```
 
-## Enable real AI generation
+## Enable Cursor agent generation
 
-Edit `.env` and set:
+Create an API key at [Cursor Dashboard → Integrations](https://cursor.com/dashboard/integrations), then edit `.env`:
 
 ```env
-OPENAI_API_KEY=your_key_here
+CURSOR_API_KEY=cursor_...
+CURSOR_MODEL=composer-2.5
 ```
 
 Restart the backend:
@@ -67,3 +68,5 @@ Restart the backend:
 ```bash
 docker compose up -d --build backend
 ```
+
+Without a key, the API falls back to a local mock script so the dashboard still works.

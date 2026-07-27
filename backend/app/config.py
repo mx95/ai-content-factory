@@ -8,8 +8,8 @@ class Settings(BaseSettings):
     database_url: str
     redis_url: str = "redis://redis:6379/0"
     rabbitmq_url: str = "amqp://content_factory:change_me_rabbitmq@rabbitmq:5672/"
-    openai_api_key: str = ""
-    openai_model: str = "gpt-5-mini"
+    cursor_api_key: str = ""
+    cursor_model: str = "composer-2.5"
 
 
 settings = Settings()
