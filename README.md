@@ -6,7 +6,7 @@ Dockerized MVP for an automated AI video generation platform.
 
 - React dashboard: topic → script → automatic video render → preview → Approve / Reject
 - Cursor cloud agent (or mock) for scripts
-- Free/local media pipeline: edge-TTS + Pillow scene images + SRT + FFmpeg 1080×1920 MP4
+- Free/local media pipeline: edge-TTS (espeak-ng fallback) + Pillow scene images + SRT + FFmpeg 1080×1920 MP4
 - RabbitMQ worker (`worker` service)
 - PostgreSQL, Redis, Nginx, Portainer
 - GitHub Actions CI + deploy to Hetzner on `main`

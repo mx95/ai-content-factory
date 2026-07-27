@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg curl fonts-dejavu-core \
+    && apt-get install -y --no-install-recommends ffmpeg curl fonts-dejavu-core espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

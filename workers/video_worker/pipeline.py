@@ -54,8 +54,39 @@ def _probe_duration(path: Path) -> float:
 
 
 async def _synthesize_scene(text: str, output: Path, voice: str) -> None:
-    communicate = edge_tts.Communicate(text=text, voice=voice)
-    await communicate.save(str(output))
+    try:
+        communicate = edge_tts.Communicate(text=text, voice=voice)
+        await communicate.save(str(output))
+        if output.stat().st_size > 0:
+            return
+        raise RuntimeError("edge-tts produced empty audio")
+    except Exception as exc:
+        logger.warning("edge-tts failed (%s); falling back to espeak-ng", exc)
+        _synthesize_with_espeak(text, output)
+
+
+def _synthesize_with_espeak(text: str, output: Path) -> None:
+    wav_path = output.with_suffix(".wav")
+    subprocess.run(
+        ["espeak-ng", "-w", str(wav_path), text],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(wav_path),
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "4",
+            str(output),
+        ]
+    )
+    wav_path.unlink(missing_ok=True)
 
 
 def _pick_voice(language: str | None = None) -> str:
