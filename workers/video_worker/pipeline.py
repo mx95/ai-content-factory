@@ -316,7 +316,6 @@ def _caption_chunks(narration: str, max_words: int = 6) -> list[str]:
     if not cleaned:
         return []
 
-    # Prefer sentence/clause boundaries, then pack into short word groups.
     pieces: list[str] = []
     for sentence in re.split(r"(?<=[.!?])\s+", cleaned):
         words = sentence.split()
@@ -329,38 +328,80 @@ def _caption_chunks(narration: str, max_words: int = 6) -> list[str]:
     return pieces or [cleaned]
 
 
+def _timed_words(scenes: list[dict], durations: list[float]) -> list[tuple[str, float, float]]:
+    """Estimate per-word timing from scene audio durations (character-weighted)."""
+    timed: list[tuple[str, float, float]] = []
+    cursor = 0.0
+    for scene, duration in zip(scenes, durations):
+        words = " ".join((scene.get("narration") or "").split()).split()
+        if not words:
+            cursor += duration
+            continue
+        weights = [max(len(re.sub(r"[^\w]", "", w)), 1) for w in words]
+        total = sum(weights) or 1
+        local = 0.0
+        for word, weight in zip(words, weights):
+            word_dur = duration * (weight / total)
+            start = cursor + local
+            end = start + max(word_dur, 0.12)
+            timed.append((word, start, min(cursor + duration, end)))
+            local += word_dur
+        cursor += duration
+    return timed
+
+
 def write_srt(scenes: list[dict], durations: list[float], output: Path) -> None:
     lines: list[str] = []
-    cursor = 0.0
     cue_index = 1
-
-    for scene, duration in zip(scenes, durations):
-        narration = " ".join((scene.get("narration") or "").split())
-        chunks = _caption_chunks(narration, max_words=6)
-        weights = [max(len(chunk), 1) for chunk in chunks]
-        total_weight = sum(weights) or 1
-        # Leave a tiny gap between cues so captions feel sequential with speech.
-        usable = max(duration - 0.05 * max(len(chunks) - 1, 0), duration * 0.92)
-        local = 0.0
-
-        for chunk, weight in zip(chunks, weights):
-            chunk_duration = usable * (weight / total_weight)
-            start = cursor + local
-            end = min(cursor + duration, start + chunk_duration)
-            if end <= start:
-                end = start + 0.35
-            # Max 2 short lines at the bottom.
-            wrapped = textwrap.fill(chunk, width=24)
-            lines.append(str(cue_index))
-            lines.append(f"{_ts(start)} --> {_ts(end)}")
-            lines.append(wrapped)
-            lines.append("")
-            cue_index += 1
-            local = end - cursor + 0.04
-
-        cursor += duration
-
+    for word, start, end in _timed_words(scenes, durations):
+        lines.append(str(cue_index))
+        lines.append(f"{_ts(start)} --> {_ts(end)}")
+        lines.append(word)
+        lines.append("")
+        cue_index += 1
     output.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _ass_ts(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    return f"{hours}:{minutes:02d}:{secs:05.2f}"
+
+
+def _ass_escape(text: str) -> str:
+    return text.replace("{", "(").replace("}", ")").replace("\\", "\\\\").replace("\n", " ")
+
+
+def write_ass_karaoke(scenes: list[dict], durations: list[float], output: Path) -> None:
+    """Word-by-word pop captions timed to speech for a dynamic Shorts look."""
+    header = """[Script Info]
+Title: AI Content Factory Karaoke
+ScriptType: v4.00+
+PlayResX: 1080
+PlayResY: 1920
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: WordPop,DejaVu Sans,64,&H00FFFFFF,&H0000E5FF,&HDC000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,2,60,60,210,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    events: list[str] = []
+    for word, start, end in _timed_words(scenes, durations):
+        clean = _ass_escape(word)
+        # Pop-in scale so each spoken word feels punchy and easy to follow.
+        text = (
+            r"{\fad(40,60)\t(0,90,\fscx130\fscy130)\t(90,160,\fscx100\fscy100)\bord4}"
+            + clean
+        )
+        events.append(
+            f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(max(end, start + 0.12))},WordPop,,0,0,0,,{text}"
+        )
+    output.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
 
 
 def _ts(seconds: float) -> str:
@@ -384,10 +425,11 @@ def render_video(
     scene_images: list[Path],
     durations: list[float],
     narration_path: Path,
-    srt_path: Path,
+    scenes: list[dict],
     output_path: Path,
 ) -> None:
-    work = output_path.parent / "segments"
+    work_name = "segments_demo" if output_path.name != "final.mp4" else "segments"
+    work = output_path.parent / work_name
     work.mkdir(parents=True, exist_ok=True)
     segment_files: list[Path] = []
 
@@ -446,8 +488,11 @@ def render_video(
         ]
     )
 
-    srt_abs = srt_path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-    # Thin outline captions at the bottom — no opaque black boxes covering the frame.
+    captions_stem = "captions_demo" if output_path.name != "final.mp4" else "captions"
+    ass_path = output_path.parent / f"{captions_stem}.ass"
+    write_ass_karaoke(scenes, durations, ass_path)
+    write_srt(scenes, durations, output_path.parent / f"{captions_stem}.srt")
+    ass_abs = ass_path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     _run_ffmpeg(
         [
             "ffmpeg",
@@ -457,12 +502,7 @@ def render_video(
             "-i",
             str(narration_path),
             "-vf",
-            (
-                f"subtitles={srt_abs}:"
-                "force_style='FontName=DejaVu Sans,Fontsize=12,PrimaryColour=&H00FFFFFF&,"
-                "OutlineColour=&H90000000&,BorderStyle=1,Outline=1,Shadow=0,"
-                "Alignment=2,MarginV=160,Bold=0'"
-            ),
+            f"ass={ass_abs}",
             "-c:v",
             "libx264",
             "-preset",
@@ -481,11 +521,21 @@ def render_video(
     )
 
 
-async def build_video_assets(video_id: int, title: str, scenes: list[dict], language: str | None = None) -> dict:
+async def build_video_assets(
+    video_id: int,
+    title: str,
+    scenes: list[dict],
+    language: str | None = None,
+    *,
+    max_scenes: int | None = None,
+    output_filename: str = "final.mp4",
+) -> dict:
     out_dir = video_dir(video_id)
     edge_voice = _pick_edge_voice(language)
     gate = OpenAIGate()
     ordered = sorted(scenes, key=lambda item: int(item.get("order", 0)))
+    if max_scenes is not None:
+        ordered = ordered[: max(1, max_scenes)]
     if not ordered:
         raise RuntimeError("Script has no scenes")
 
@@ -511,7 +561,7 @@ async def build_video_assets(video_id: int, title: str, scenes: list[dict], lang
         durations.append(duration)
         scene_images.append(image_path)
 
-    narration_path = out_dir / "narration.mp3"
+    narration_path = out_dir / ("demo_narration.mp3" if output_filename != "final.mp4" else "narration.mp3")
     concat_audio = out_dir / "audio_concat.txt"
     concat_audio.write_text(
         "\n".join(f"file '{path.resolve().as_posix()}'" for path in scene_audio_paths) + "\n",
@@ -538,22 +588,39 @@ async def build_video_assets(video_id: int, title: str, scenes: list[dict], lang
     srt_path = out_dir / "captions.srt"
     write_srt(ordered, durations, srt_path)
 
-    video_path = out_dir / "final.mp4"
-    logger.info("Compositing final.mp4 for video %s", video_id)
-    render_video(scene_images, durations, narration_path, srt_path, video_path)
+    video_path = out_dir / output_filename
+    logger.info("Compositing %s for video %s", output_filename, video_id)
+    render_video(scene_images, durations, narration_path, ordered, video_path)
 
-    thumb_path = out_dir / "thumb.png"
+    thumb_path = out_dir / ("demo_thumb.png" if output_filename != "final.mp4" else "thumb.png")
     generate_thumbnail(scene_images[0], title, thumb_path)
 
     total_duration = _probe_duration(video_path)
     return {
-        "voice_path": f"videos/{video_id}/narration.mp3",
-        "video_path": f"videos/{video_id}/final.mp4",
-        "thumbnail_path": f"videos/{video_id}/thumb.png",
+        "voice_path": f"videos/{video_id}/{narration_path.name}",
+        "video_path": f"videos/{video_id}/{output_filename}",
+        "thumbnail_path": f"videos/{video_id}/{thumb_path.name}",
         "srt_path": f"videos/{video_id}/captions.srt",
         "duration_seconds": total_duration,
     }
 
 
-def run_pipeline(video_id: int, title: str, scenes: list[dict], language: str | None = None) -> dict:
-    return asyncio.run(build_video_assets(video_id, title, scenes, language))
+def run_pipeline(
+    video_id: int,
+    title: str,
+    scenes: list[dict],
+    language: str | None = None,
+    *,
+    max_scenes: int | None = None,
+    output_filename: str = "final.mp4",
+) -> dict:
+    return asyncio.run(
+        build_video_assets(
+            video_id,
+            title,
+            scenes,
+            language,
+            max_scenes=max_scenes,
+            output_filename=output_filename,
+        )
+    )

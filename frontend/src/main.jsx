@@ -22,6 +22,8 @@ function App() {
   const [video, setVideo] = useState(null);
   const [loading, setLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState("");
+  const [demoStatus, setDemoStatus] = useState(""); // "", "queued", "ready", "missing"
+  const [demoUrl, setDemoUrl] = useState(null);
   const [error, setError] = useState("");
 
   async function loadScripts(preferredId = null) {
@@ -95,12 +97,31 @@ function App() {
         throw new Error(detail.detail || `${action} failed`);
       }
       const data = await response.json();
+      if (action === "demo") {
+        setDemoStatus("queued");
+        setDemoUrl(`${API_BASE}/media/${video.id}/demo.mp4?t=${Date.now()}`);
+        return;
+      }
       setVideo(data);
       await loadScripts(selected?.id);
     } catch (err) {
       setError(err.message);
     } finally {
       setActionLoading("");
+    }
+  }
+
+  async function checkDemoReady(videoId) {
+    if (!videoId) return;
+    const url = `${API_BASE}/media/${videoId}/demo.mp4`;
+    try {
+      const response = await fetch(url, { method: "HEAD", cache: "no-store" });
+      if (response.ok) {
+        setDemoStatus("ready");
+        setDemoUrl(`${url}?t=${Date.now()}`);
+      }
+    } catch {
+      /* still rendering */
     }
   }
 
@@ -124,6 +145,24 @@ function App() {
     }, 3000);
     return () => clearInterval(timer);
   }, [video?.id, video?.status]);
+
+  useEffect(() => {
+    if (!video?.id) {
+      setDemoStatus("");
+      setDemoUrl(null);
+      return undefined;
+    }
+    checkDemoReady(video.id);
+    return undefined;
+  }, [video?.id]);
+
+  useEffect(() => {
+    if (!video?.id || demoStatus !== "queued") return undefined;
+    const timer = setInterval(() => {
+      checkDemoReady(video.id);
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [video?.id, demoStatus]);
 
   const isBusy = video && ["queued", "rendering"].includes(video.status);
   const isReady = video?.status === "ready";
@@ -226,6 +265,31 @@ function App() {
                   )}
                   {video?.status === "failed" && (
                     <p className="pipeline-error">{video.error || "Render failed"}</p>
+                  )}
+                  <div className="action-row" style={{ marginBottom: "1rem" }}>
+                    <button
+                      className="action regenerate"
+                      disabled={!!actionLoading || !video?.id}
+                      onClick={() => runVideoAction("demo")}
+                    >
+                      {actionLoading === "demo" || demoStatus === "queued" ? (
+                        <Loader2 className="spin" size={16} />
+                      ) : (
+                        <Play size={16} />
+                      )}
+                      Word-pop demo (2 scenes)
+                    </button>
+                  </div>
+                  {demoStatus === "queued" && (
+                    <p className="pipeline-status">
+                      <Loader2 className="spin" size={16} /> Building short karaoke demo…
+                    </p>
+                  )}
+                  {demoStatus === "ready" && demoUrl && (
+                    <div className="preview-block">
+                      <p className="muted">Word-by-word karaoke demo</p>
+                      <video className="preview-video" src={demoUrl} controls playsInline autoPlay />
+                    </div>
                   )}
                   {(isReady || video?.status === "approved" || video?.status === "rejected") && videoUrl && (
                     <div className="preview-block">

@@ -195,6 +195,28 @@ def render_video(video_id: int, db: Session = Depends(get_db)) -> VideoJobRespon
     return _video_response(result.unique().scalar_one())
 
 
+@app.post("/videos/{video_id}/demo")
+def render_demo(video_id: int, db: Session = Depends(get_db)) -> dict:
+    """Queue a short karaoke demo (first 2 scenes) without replacing final.mp4."""
+    result = db.execute(
+        select(VideoJob).options(joinedload(VideoJob.script)).where(VideoJob.id == video_id)
+    )
+    job = result.unique().scalar_one_or_none()
+    if not job:
+        raise HTTPException(status_code=404, detail="Video not found")
+    try:
+        enqueue_video_render(job.id, force=True, demo=True, max_scenes=2)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Queue publish failed: {exc}") from exc
+    return {
+        "status": "queued",
+        "video_id": job.id,
+        "demo": True,
+        "max_scenes": 2,
+        "preview_url": f"/api/media/{job.id}/demo.mp4",
+    }
+
+
 @app.post("/videos/{video_id}/approve", response_model=VideoJobResponse)
 def approve_video(video_id: int, db: Session = Depends(get_db)) -> VideoJobResponse:
     result = db.execute(

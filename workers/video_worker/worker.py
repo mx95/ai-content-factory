@@ -24,7 +24,13 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def process_video(video_id: int, force: bool = False) -> None:
+def process_video(
+    video_id: int,
+    force: bool = False,
+    *,
+    demo: bool = False,
+    max_scenes: int | None = None,
+) -> None:
     db = SessionLocal()
     try:
         result = db.execute(
@@ -38,7 +44,25 @@ def process_video(video_id: int, force: bool = False) -> None:
             logger.error("VideoJob %s has no script", video_id)
             return
 
-        # Prevent infinite re-render/email loops when RabbitMQ redelivers an unacked message.
+        if demo:
+            logger.info("Rendering DEMO for video_id=%s (max_scenes=%s)", video_id, max_scenes or 2)
+            assets = run_pipeline(
+                video_id=job.id,
+                title=job.script.title,
+                scenes=job.script.scenes,
+                language=None,
+                max_scenes=max_scenes or 2,
+                output_filename="demo.mp4",
+            )
+            send_video_notification(
+                video_id=job.id,
+                title=f"[DEMO] {job.script.title}",
+                status="ready",
+                duration_seconds=assets["duration_seconds"],
+            )
+            logger.info("Demo ready for video %s (%.1fs)", video_id, assets["duration_seconds"] or 0)
+            return
+
         if job.status in {"ready", "approved", "rejected"} and not force:
             logger.info("Skipping video_id=%s (already %s)", video_id, job.status)
             return
@@ -77,6 +101,14 @@ def process_video(video_id: int, force: bool = False) -> None:
     except Exception as exc:
         logger.exception("Render failed for video_id=%s", video_id)
         db.rollback()
+        if demo:
+            send_video_notification(
+                video_id=video_id,
+                title=f"[DEMO] Video {video_id}",
+                status="failed",
+                error=str(exc)[:1000],
+            )
+            return
         result = db.execute(
             select(VideoJob).options(joinedload(VideoJob.script)).where(VideoJob.id == video_id)
         )
@@ -106,11 +138,16 @@ def process_video(video_id: int, force: bool = False) -> None:
 
 def on_message(channel, method, properties, body) -> None:  # noqa: ANN001
     force = False
+    demo = False
+    max_scenes = None
     video_id = None
     try:
         payload = json.loads(body.decode("utf-8"))
         video_id = int(payload["video_id"])
         force = bool(payload.get("force", False))
+        demo = bool(payload.get("demo", False))
+        if payload.get("max_scenes") is not None:
+            max_scenes = int(payload["max_scenes"])
     except Exception:
         logger.exception("Invalid message: %s", body)
         try:
@@ -119,13 +156,12 @@ def on_message(channel, method, properties, body) -> None:  # noqa: ANN001
             logger.exception("Failed to ack invalid message")
         return
 
-    # Ack early so a long FFmpeg job cannot lose the AMQP connection and redeliver forever.
     try:
         channel.basic_ack(delivery_tag=method.delivery_tag)
     except Exception:
         logger.exception("Failed to ack message for video_id=%s", video_id)
 
-    process_video(video_id, force=force)
+    process_video(video_id, force=force, demo=demo, max_scenes=max_scenes)
 
 
 def main() -> None:
@@ -133,7 +169,6 @@ def main() -> None:
     while True:
         try:
             params = pika.URLParameters(settings.rabbitmq_url)
-            # Long renders block the pika IO loop; disable heartbeats to avoid dropped connections.
             params.heartbeat = 0
             connection = pika.BlockingConnection(params)
             channel = connection.channel()
