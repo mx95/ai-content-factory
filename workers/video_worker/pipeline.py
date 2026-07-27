@@ -455,13 +455,17 @@ def _flatten_timed_words(scene_words: list[list[WordTiming]], durations: list[fl
 
 
 def _display_windows(timed: list[WordTiming]) -> list[WordTiming]:
-    """Keep each word visible until the next word starts for readable karaoke sync."""
+    """Show each word from its spoken start until the next word begins."""
     if not timed:
         return []
     windows: list[WordTiming] = []
     for index, (word, start, end) in enumerate(timed):
-        next_start = timed[index + 1][1] if index + 1 < len(timed) else end
-        display_end = max(end, min(next_start, start + 0.85), start + 0.12)
+        if index + 1 < len(timed):
+            display_end = timed[index + 1][1]
+        else:
+            display_end = max(end, start + 0.2)
+        if display_end <= start:
+            display_end = start + 0.08
         windows.append((word, start, display_end))
     return windows
 
