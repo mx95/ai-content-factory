@@ -77,3 +77,20 @@ docker compose up -d --build worker backend
 ```
 
 Without this key, the worker falls back to edge-TTS/espeak and Pillow slides.
+
+## Email notifications
+
+When a render finishes (`ready` or `failed`), the worker can email you.
+
+```env
+APP_PUBLIC_URL=http://2.28.0.8
+NOTIFY_EMAIL_TO=you@example.com
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=you@gmail.com
+SMTP_PASSWORD=your_app_password
+SMTP_FROM=you@gmail.com
+SMTP_USE_TLS=true
+```
+
+For Gmail, create an [App Password](https://myaccount.google.com/apppasswords) (2FA required).

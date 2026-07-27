@@ -11,6 +11,7 @@ from sqlalchemy.orm import joinedload
 
 from config import settings
 from models import SessionLocal, VideoJob
+from notify import send_video_notification
 from pipeline import run_pipeline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -58,17 +59,31 @@ def process_video(video_id: int) -> None:
         db.add(job)
         db.commit()
         logger.info("Video %s ready (%.1fs)", video_id, job.duration_seconds or 0)
+        send_video_notification(
+            video_id=job.id,
+            title=job.script.title,
+            status="ready",
+            duration_seconds=job.duration_seconds,
+        )
     except Exception as exc:
         logger.exception("Render failed for video_id=%s", video_id)
         db.rollback()
-        result = db.execute(select(VideoJob).where(VideoJob.id == video_id))
-        job = result.scalar_one_or_none()
+        result = db.execute(
+            select(VideoJob).options(joinedload(VideoJob.script)).where(VideoJob.id == video_id)
+        )
+        job = result.unique().scalar_one_or_none()
         if job:
             job.status = "failed"
             job.error = str(exc)[:4000]
             job.updated_at = datetime.utcnow()
             db.add(job)
             db.commit()
+            send_video_notification(
+                video_id=job.id,
+                title=job.script.title if job.script else f"Video {video_id}",
+                status="failed",
+                error=job.error,
+            )
     finally:
         db.close()
 
