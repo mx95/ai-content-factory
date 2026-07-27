@@ -121,11 +121,26 @@ def _synthesize_with_openai(text: str, output: Path) -> None:
         raise RuntimeError("OpenAI TTS produced empty audio")
 
 
-async def _synthesize_with_edge(text: str, output: Path, voice: str) -> None:
+WordTiming = tuple[str, float, float]  # word, start_sec, end_sec
+
+
+async def _synthesize_with_edge(text: str, output: Path, voice: str) -> list[WordTiming]:
+    """Synthesize audio and return real word timestamps from Edge WordBoundary events."""
     communicate = edge_tts.Communicate(text=text, voice=voice)
-    await communicate.save(str(output))
+    words: list[WordTiming] = []
+    with output.open("wb") as audio_file:
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_file.write(chunk["data"])
+            elif chunk["type"] == "WordBoundary":
+                start = float(chunk["offset"]) / 10_000_000
+                end = start + (float(chunk["duration"]) / 10_000_000)
+                word = str(chunk.get("text") or "").strip()
+                if word:
+                    words.append((word, start, max(end, start + 0.08)))
     if output.stat().st_size <= 0:
         raise RuntimeError("edge-tts produced empty audio")
+    return words
 
 
 def _synthesize_with_espeak(text: str, output: Path) -> None:
@@ -152,21 +167,108 @@ def _synthesize_with_espeak(text: str, output: Path) -> None:
     wav_path.unlink(missing_ok=True)
 
 
-async def _synthesize_scene(text: str, output: Path, edge_voice: str, gate: OpenAIGate) -> None:
+def _align_words_with_whisper(audio_path: Path, gate: OpenAIGate) -> list[WordTiming]:
+    """Force-align generated speech with Whisper word timestamps."""
+    if not gate.enabled:
+        raise RuntimeError("OpenAI unavailable for whisper alignment")
+    client = _openai_client()
+    if client is None:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+    with audio_path.open("rb") as audio_file:
+        result = client.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="verbose_json",
+            timestamp_granularities=["word"],
+        )
+    words_payload = getattr(result, "words", None) or []
+    timed: list[WordTiming] = []
+    for item in words_payload:
+        if isinstance(item, dict):
+            word = str(item.get("word") or "").strip()
+            start = float(item.get("start") or 0.0)
+            end = float(item.get("end") or start)
+        else:
+            word = str(getattr(item, "word", "") or "").strip()
+            start = float(getattr(item, "start", 0.0) or 0.0)
+            end = float(getattr(item, "end", start) or start)
+        if word:
+            timed.append((word, start, max(end, start + 0.08)))
+    if not timed:
+        raise RuntimeError("Whisper returned no word timestamps")
+    return timed
+
+
+def _estimate_words(text: str, duration: float) -> list[WordTiming]:
+    words = " ".join(text.split()).split()
+    if not words:
+        return []
+    weights = [max(len(re.sub(r"[^\w]", "", w)), 1) for w in words]
+    total = sum(weights) or 1
+    timed: list[WordTiming] = []
+    local = 0.0
+    for word, weight in zip(words, weights):
+        word_dur = duration * (weight / total)
+        start = local
+        end = start + max(word_dur, 0.08)
+        timed.append((word, start, min(duration, end)))
+        local += word_dur
+    return timed
+
+
+def _pad_audio_to_duration(path: Path, target: float) -> float:
+    """Pad short clips with silence so video segments match the narration timeline."""
+    current = _probe_duration(path)
+    if current >= target - 0.02:
+        return current
+    padded = path.with_name(f"{path.stem}_padded{path.suffix}")
+    pad = max(target - current, 0.01)
+    _run_ffmpeg(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(path),
+            "-af",
+            f"apad=pad_dur={pad:.3f}",
+            "-c:a",
+            "libmp3lame",
+            "-q:a",
+            "4",
+            str(padded),
+        ]
+    )
+    padded.replace(path)
+    return _probe_duration(path)
+
+
+async def _synthesize_scene(
+    text: str, output: Path, edge_voice: str, gate: OpenAIGate
+) -> list[WordTiming]:
+    """Generate scene audio and return per-word timings relative to this clip."""
     if gate.enabled:
         try:
             await asyncio.to_thread(_synthesize_with_openai, text, output)
-            return
+            try:
+                return await asyncio.to_thread(_align_words_with_whisper, output, gate)
+            except Exception as exc:
+                gate.note_failure(exc)
+                logger.warning("Whisper word-align failed (%s); using edge-tts for sync", exc)
         except Exception as exc:
             gate.note_failure(exc)
             logger.warning("OpenAI TTS failed (%s); trying edge-tts", exc)
 
     try:
-        await _synthesize_with_edge(text, output, edge_voice)
-        return
+        words = await _synthesize_with_edge(text, output, edge_voice)
+        if words:
+            return words
+        duration = max(_probe_duration(output), 0.4)
+        return _estimate_words(text, duration)
     except Exception as exc:
         logger.warning("edge-tts failed (%s); falling back to espeak-ng", exc)
         await asyncio.to_thread(_synthesize_with_espeak, text, output)
+        duration = max(_probe_duration(output), 0.4)
+        return _estimate_words(text, duration)
 
 
 def _pick_edge_voice(language: str | None = None) -> str:
@@ -328,32 +430,37 @@ def _caption_chunks(narration: str, max_words: int = 6) -> list[str]:
     return pieces or [cleaned]
 
 
-def _timed_words(scenes: list[dict], durations: list[float]) -> list[tuple[str, float, float]]:
-    """Estimate per-word timing from scene audio durations (character-weighted)."""
-    timed: list[tuple[str, float, float]] = []
+def _offset_words(words: list[WordTiming], offset: float) -> list[WordTiming]:
+    return [(word, start + offset, end + offset) for word, start, end in words]
+
+
+def _flatten_timed_words(scene_words: list[list[WordTiming]], durations: list[float]) -> list[WordTiming]:
+    """Combine per-scene word timings onto the concatenated narration timeline."""
+    timed: list[WordTiming] = []
     cursor = 0.0
-    for scene, duration in zip(scenes, durations):
-        words = " ".join((scene.get("narration") or "").split()).split()
-        if not words:
-            cursor += duration
-            continue
-        weights = [max(len(re.sub(r"[^\w]", "", w)), 1) for w in words]
-        total = sum(weights) or 1
-        local = 0.0
-        for word, weight in zip(words, weights):
-            word_dur = duration * (weight / total)
-            start = cursor + local
-            end = start + max(word_dur, 0.12)
-            timed.append((word, start, min(cursor + duration, end)))
-            local += word_dur
+    for words, duration in zip(scene_words, durations):
+        if words:
+            timed.extend(_offset_words(words, cursor))
         cursor += duration
     return timed
 
 
-def write_srt(scenes: list[dict], durations: list[float], output: Path) -> None:
+def _display_windows(timed: list[WordTiming]) -> list[WordTiming]:
+    """Keep each word visible until the next word starts for readable karaoke sync."""
+    if not timed:
+        return []
+    windows: list[WordTiming] = []
+    for index, (word, start, end) in enumerate(timed):
+        next_start = timed[index + 1][1] if index + 1 < len(timed) else end
+        display_end = max(end, min(next_start, start + 0.85), start + 0.12)
+        windows.append((word, start, display_end))
+    return windows
+
+
+def write_srt(timed_words: list[WordTiming], output: Path) -> None:
     lines: list[str] = []
     cue_index = 1
-    for word, start, end in _timed_words(scenes, durations):
+    for word, start, end in _display_windows(timed_words):
         lines.append(str(cue_index))
         lines.append(f"{_ts(start)} --> {_ts(end)}")
         lines.append(word)
@@ -374,8 +481,8 @@ def _ass_escape(text: str) -> str:
     return text.replace("{", "(").replace("}", ")").replace("\\", "\\\\").replace("\n", " ")
 
 
-def write_ass_karaoke(scenes: list[dict], durations: list[float], output: Path) -> None:
-    """Word-by-word pop captions timed to speech for a dynamic Shorts look."""
+def write_ass_karaoke(timed_words: list[WordTiming], output: Path) -> None:
+    """Word-by-word pop captions timed to real speech timestamps."""
     header = """[Script Info]
 Title: AI Content Factory Karaoke
 ScriptType: v4.00+
@@ -391,7 +498,7 @@ Style: WordPop,DejaVu Sans,64,&H00FFFFFF,&H0000E5FF,&HDC000000,&H80000000,-1,0,0
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     events: list[str] = []
-    for word, start, end in _timed_words(scenes, durations):
+    for word, start, end in _display_windows(timed_words):
         clean = _ass_escape(word)
         # Pop-in scale so each spoken word feels punchy and easy to follow.
         text = (
@@ -399,7 +506,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             + clean
         )
         events.append(
-            f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(max(end, start + 0.12))},WordPop,,0,0,0,,{text}"
+            f"Dialogue: 0,{_ass_ts(start)},{_ass_ts(end)},WordPop,,0,0,0,,{text}"
         )
     output.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
 
@@ -425,7 +532,7 @@ def render_video(
     scene_images: list[Path],
     durations: list[float],
     narration_path: Path,
-    scenes: list[dict],
+    timed_words: list[WordTiming],
     output_path: Path,
 ) -> None:
     work_name = "segments_demo" if output_path.name != "final.mp4" else "segments"
@@ -453,7 +560,7 @@ def render_video(
                     f"format=yuv420p"
                 ),
                 "-t",
-                f"{max(duration, 1.5):.3f}",
+                f"{max(duration, 0.4):.3f}",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -490,8 +597,8 @@ def render_video(
 
     captions_stem = "captions_demo" if output_path.name != "final.mp4" else "captions"
     ass_path = output_path.parent / f"{captions_stem}.ass"
-    write_ass_karaoke(scenes, durations, ass_path)
-    write_srt(scenes, durations, output_path.parent / f"{captions_stem}.srt")
+    write_ass_karaoke(timed_words, ass_path)
+    write_srt(timed_words, output_path.parent / f"{captions_stem}.srt")
     ass_abs = ass_path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
     _run_ffmpeg(
         [
@@ -542,6 +649,7 @@ async def build_video_assets(
     scene_audio_paths: list[Path] = []
     durations: list[float] = []
     scene_images: list[Path] = []
+    scene_words: list[list[WordTiming]] = []
 
     for scene in ordered:
         order = int(scene.get("order", len(scene_audio_paths) + 1))
@@ -553,13 +661,17 @@ async def build_video_assets(
         audio_path = out_dir / f"scene_{order:03d}.mp3"
         image_path = out_dir / f"scene_{order:03d}.png"
         logger.info("TTS scene %s", order)
-        await _synthesize_scene(narration, audio_path, edge_voice, gate)
-        duration = max(_probe_duration(audio_path), 1.5)
-        logger.info("Image scene %s", order)
+        words = await _synthesize_scene(narration, audio_path, edge_voice, gate)
+        # Keep audio/video/caption clocks identical — pad short clips instead of stretching words.
+        duration = _pad_audio_to_duration(audio_path, max(_probe_duration(audio_path), 1.5))
+        logger.info("Image scene %s (%d timed words, %.2fs)", order, len(words), duration)
         await asyncio.to_thread(generate_scene_image, prompt, title, order, image_path, gate)
         scene_audio_paths.append(audio_path)
         durations.append(duration)
         scene_images.append(image_path)
+        scene_words.append(words)
+
+    timed_words = _flatten_timed_words(scene_words, durations)
 
     narration_path = out_dir / ("demo_narration.mp3" if output_filename != "final.mp4" else "narration.mp3")
     concat_audio = out_dir / "audio_concat.txt"
@@ -584,13 +696,25 @@ async def build_video_assets(
             str(narration_path),
         ]
     )
+    # Re-encode can slightly change length — scale word clocks to the final narration.
+    expected = sum(durations) or 1.0
+    actual = max(_probe_duration(narration_path), 0.4)
+    if abs(actual - expected) > 0.05:
+        scale = actual / expected
+        timed_words = [(word, start * scale, end * scale) for word, start, end in timed_words]
+        logger.info(
+            "Scaled caption timings by %.4f (expected=%.2fs actual=%.2fs)",
+            scale,
+            expected,
+            actual,
+        )
 
     srt_path = out_dir / "captions.srt"
-    write_srt(ordered, durations, srt_path)
+    write_srt(timed_words, srt_path)
 
     video_path = out_dir / output_filename
     logger.info("Compositing %s for video %s", output_filename, video_id)
-    render_video(scene_images, durations, narration_path, ordered, video_path)
+    render_video(scene_images, durations, narration_path, timed_words, video_path)
 
     thumb_path = out_dir / ("demo_thumb.png" if output_filename != "final.mp4" else "thumb.png")
     generate_thumbnail(scene_images[0], title, thumb_path)
