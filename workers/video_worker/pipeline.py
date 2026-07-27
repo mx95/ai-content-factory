@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import subprocess
 import textwrap
 import urllib.parse
@@ -309,20 +310,56 @@ def generate_scene_image(prompt: str, title: str, order: int, output: Path, gate
     image.save(output, format="PNG")
 
 
+def _caption_chunks(narration: str, max_words: int = 6) -> list[str]:
+    """Split narration into short bottom captions that track the voice."""
+    cleaned = " ".join((narration or "").split())
+    if not cleaned:
+        return []
+
+    # Prefer sentence/clause boundaries, then pack into short word groups.
+    pieces: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", cleaned):
+        words = sentence.split()
+        if not words:
+            continue
+        for i in range(0, len(words), max_words):
+            chunk = " ".join(words[i : i + max_words]).strip()
+            if chunk:
+                pieces.append(chunk)
+    return pieces or [cleaned]
+
+
 def write_srt(scenes: list[dict], durations: list[float], output: Path) -> None:
     lines: list[str] = []
     cursor = 0.0
-    for index, (scene, duration) in enumerate(zip(scenes, durations), start=1):
-        start = cursor
-        end = cursor + duration
+    cue_index = 1
+
+    for scene, duration in zip(scenes, durations):
         narration = " ".join((scene.get("narration") or "").split())
-        # Keep captions short so they don't cover the visuals.
-        wrapped = textwrap.fill(narration, width=32)
-        lines.append(str(index))
-        lines.append(f"{_ts(start)} --> {_ts(end)}")
-        lines.append(wrapped)
-        lines.append("")
-        cursor = end
+        chunks = _caption_chunks(narration, max_words=6)
+        weights = [max(len(chunk), 1) for chunk in chunks]
+        total_weight = sum(weights) or 1
+        # Leave a tiny gap between cues so captions feel sequential with speech.
+        usable = max(duration - 0.05 * max(len(chunks) - 1, 0), duration * 0.92)
+        local = 0.0
+
+        for chunk, weight in zip(chunks, weights):
+            chunk_duration = usable * (weight / total_weight)
+            start = cursor + local
+            end = min(cursor + duration, start + chunk_duration)
+            if end <= start:
+                end = start + 0.35
+            # Max 2 short lines at the bottom.
+            wrapped = textwrap.fill(chunk, width=24)
+            lines.append(str(cue_index))
+            lines.append(f"{_ts(start)} --> {_ts(end)}")
+            lines.append(wrapped)
+            lines.append("")
+            cue_index += 1
+            local = end - cursor + 0.04
+
+        cursor += duration
+
     output.write_text("\n".join(lines), encoding="utf-8")
 
 
@@ -422,8 +459,9 @@ def render_video(
             "-vf",
             (
                 f"subtitles={srt_abs}:"
-                "force_style='FontName=DejaVu Sans,Fontsize=14,PrimaryColour=&H00FFFFFF&,"
-                "OutlineColour=&H80000000&,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=120'"
+                "force_style='FontName=DejaVu Sans,Fontsize=12,PrimaryColour=&H00FFFFFF&,"
+                "OutlineColour=&H90000000&,BorderStyle=1,Outline=1,Shadow=0,"
+                "Alignment=2,MarginV=160,Bold=0'"
             ),
             "-c:v",
             "libx264",
