@@ -72,14 +72,14 @@ def _video_response(job: VideoJob) -> VideoJobResponse:
     )
 
 
-def _enqueue(job: VideoJob, db: Session) -> VideoJob:
+def _enqueue(job: VideoJob, db: Session, force: bool = False) -> VideoJob:
     job.status = "queued"
     job.error = None
     db.add(job)
     db.commit()
     db.refresh(job)
     try:
-        enqueue_video_render(job.id)
+        enqueue_video_render(job.id, force=force)
     except Exception as exc:
         logger.exception("Failed to enqueue video %s", job.id)
         job.status = "failed"
@@ -188,7 +188,7 @@ def render_video(video_id: int, db: Session = Depends(get_db)) -> VideoJobRespon
     job = result.unique().scalar_one_or_none()
     if not job:
         raise HTTPException(status_code=404, detail="Video not found")
-    job = _enqueue(job, db)
+    job = _enqueue(job, db, force=True)
     result = db.execute(
         select(VideoJob).options(joinedload(VideoJob.script)).where(VideoJob.id == video_id)
     )
