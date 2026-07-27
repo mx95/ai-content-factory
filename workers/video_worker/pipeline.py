@@ -126,8 +126,8 @@ WordTiming = tuple[str, float, float]  # word, start_sec, end_sec
 
 async def _synthesize_with_edge(text: str, output: Path, voice: str) -> list[WordTiming]:
     """Synthesize audio and return real word timestamps from Edge WordBoundary events."""
-    communicate = edge_tts.Communicate(text=text, voice=voice)
-    words: list[WordTiming] = []
+    communicate = edge_tts.Communicate(text=text, voice=voice, boundary="WordBoundary")
+    boundaries: list[WordTiming] = []
     with output.open("wb") as audio_file:
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
@@ -137,10 +137,19 @@ async def _synthesize_with_edge(text: str, output: Path, voice: str) -> list[Wor
                 end = start + (float(chunk["duration"]) / 10_000_000)
                 word = str(chunk.get("text") or "").strip()
                 if word:
-                    words.append((word, start, max(end, start + 0.08)))
+                    boundaries.append((word, start, max(end, start + 0.08)))
     if output.stat().st_size <= 0:
         raise RuntimeError("edge-tts produced empty audio")
-    return words
+    if not boundaries:
+        return []
+    # Prefer script tokens (keeps punctuation) when counts match Edge boundaries.
+    script_words = " ".join(text.split()).split()
+    if len(script_words) == len(boundaries):
+        return [
+            (script_word, start, end)
+            for script_word, (_edge_word, start, end) in zip(script_words, boundaries)
+        ]
+    return boundaries
 
 
 def _synthesize_with_espeak(text: str, output: Path) -> None:
