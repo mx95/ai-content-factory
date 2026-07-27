@@ -115,8 +115,13 @@ function App() {
     if (!videoId) return;
     const url = `${API_BASE}/media/${videoId}/demo.mp4`;
     try {
-      const response = await fetch(url, { method: "HEAD", cache: "no-store" });
-      if (response.ok) {
+      // FileResponse only allows GET (HEAD → 405 via nginx), so probe with a tiny range request.
+      const response = await fetch(url, {
+        method: "GET",
+        headers: { Range: "bytes=0-0" },
+        cache: "no-store",
+      });
+      if (response.ok || response.status === 206) {
         setDemoStatus("ready");
         setDemoUrl(`${url}?t=${Date.now()}`);
       }
