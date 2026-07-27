@@ -1,6 +1,14 @@
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Clapperboard, Loader2, Play, RefreshCw } from "lucide-react";
+import {
+  Check,
+  Clapperboard,
+  Loader2,
+  Play,
+  RefreshCw,
+  RotateCcw,
+  X,
+} from "lucide-react";
 import "./styles.css";
 
 const API_BASE = "/api";
@@ -11,15 +19,36 @@ function App() {
   const [duration, setDuration] = useState(45);
   const [scripts, setScripts] = useState([]);
   const [selected, setSelected] = useState(null);
+  const [video, setVideo] = useState(null);
   const [loading, setLoading] = useState(false);
+  const [actionLoading, setActionLoading] = useState("");
   const [error, setError] = useState("");
 
-  async function loadScripts() {
+  async function loadScripts(preferredId = null) {
     const response = await fetch(`${API_BASE}/scripts`);
     if (!response.ok) throw new Error("Could not load scripts");
     const data = await response.json();
     setScripts(data);
-    setSelected((current) => current || data[0] || null);
+    setSelected((current) => {
+      if (preferredId) {
+        return data.find((item) => item.id === preferredId) || data[0] || null;
+      }
+      if (current) {
+        return data.find((item) => item.id === current.id) || data[0] || null;
+      }
+      return data[0] || null;
+    });
+  }
+
+  async function loadVideo(videoId) {
+    if (!videoId) {
+      setVideo(null);
+      return;
+    }
+    const response = await fetch(`${API_BASE}/videos/${videoId}`);
+    if (!response.ok) throw new Error("Could not load video job");
+    const data = await response.json();
+    setVideo(data);
   }
 
   async function generateScript(event) {
@@ -37,10 +66,15 @@ function App() {
           niche: "Did You Know",
         }),
       });
-      if (!response.ok) throw new Error("Generation failed");
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(detail.detail || "Generation failed");
+      }
       const script = await response.json();
-      setSelected(script);
-      await loadScripts();
+      await loadScripts(script.id);
+      if (script.video_id) {
+        await loadVideo(script.video_id);
+      }
     } catch (err) {
       setError(err.message);
     } finally {
@@ -48,9 +82,53 @@ function App() {
     }
   }
 
+  async function runVideoAction(action) {
+    if (!video?.id) return;
+    setActionLoading(action);
+    setError("");
+    try {
+      const response = await fetch(`${API_BASE}/videos/${video.id}/${action}`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const detail = await response.json().catch(() => ({}));
+        throw new Error(detail.detail || `${action} failed`);
+      }
+      const data = await response.json();
+      setVideo(data);
+      await loadScripts(selected?.id);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setActionLoading("");
+    }
+  }
+
   useEffect(() => {
     loadScripts().catch((err) => setError(err.message));
   }, []);
+
+  useEffect(() => {
+    if (!selected?.video_id) {
+      setVideo(null);
+      return;
+    }
+    loadVideo(selected.video_id).catch((err) => setError(err.message));
+  }, [selected?.id, selected?.video_id]);
+
+  useEffect(() => {
+    if (!video?.id) return undefined;
+    if (!["queued", "rendering"].includes(video.status)) return undefined;
+    const timer = setInterval(() => {
+      loadVideo(video.id).catch(() => {});
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [video?.id, video?.status]);
+
+  const isBusy = video && ["queued", "rendering"].includes(video.status);
+  const isReady = video?.status === "ready";
+  const videoUrl = video?.id ? `${API_BASE}/media/${video.id}/final.mp4` : null;
+  const thumbUrl = video?.id ? `${API_BASE}/media/${video.id}/thumb.png` : null;
 
   return (
     <main className="app-shell">
@@ -86,7 +164,7 @@ function App() {
           </label>
           <button type="submit" disabled={loading}>
             {loading ? <Loader2 className="spin" size={18} /> : <Play size={18} />}
-            Generate Script
+            Generate & Render
           </button>
           {error && <p className="error">{error}</p>}
         </form>
@@ -95,18 +173,22 @@ function App() {
       <section className="workspace">
         <header className="topbar">
           <div>
-            <h1>Script Studio</h1>
-            <p>Milestone 1: topic to saved video script.</p>
+            <h1>Video Studio</h1>
+            <p>Script → voice → images → captions → MP4 → approve.</p>
           </div>
-          <button className="icon-button" onClick={() => loadScripts()} aria-label="Refresh scripts">
+          <button
+            className="icon-button"
+            onClick={() => loadScripts(selected?.id).catch((err) => setError(err.message))}
+            aria-label="Refresh"
+          >
             <RefreshCw size={18} />
           </button>
         </header>
 
         <div className="content-grid">
           <section className="script-list">
-            <h2>Recent Scripts</h2>
-            {scripts.length === 0 && <p className="muted">No scripts yet.</p>}
+            <h2>Recent Jobs</h2>
+            {scripts.length === 0 && <p className="muted">No jobs yet.</p>}
             {scripts.map((script) => (
               <button
                 className={selected?.id === script.id ? "script-row active" : "script-row"}
@@ -114,7 +196,9 @@ function App() {
                 onClick={() => setSelected(script)}
               >
                 <strong>{script.title}</strong>
-                <span>{new Date(script.created_at).toLocaleString()}</span>
+                <span>
+                  {script.video_status || script.status} · {new Date(script.created_at).toLocaleString()}
+                </span>
               </button>
             ))}
           </section>
@@ -124,10 +208,69 @@ function App() {
               <>
                 <div className="script-heading">
                   <h2>{selected.title}</h2>
-                  <span>{selected.status}</span>
+                  <span>{video?.status || selected.video_status || selected.status}</span>
                 </div>
                 <p>{selected.description}</p>
-                <div className="hashtags">{selected.hashtags.map((tag) => <span key={tag}>{tag}</span>)}</div>
+                <div className="hashtags">
+                  {selected.hashtags.map((tag) => (
+                    <span key={tag}>{tag}</span>
+                  ))}
+                </div>
+
+                <div className="pipeline-panel">
+                  <h3>Render pipeline</h3>
+                  {isBusy && (
+                    <p className="pipeline-status">
+                      <Loader2 className="spin" size={16} /> Rendering video… this can take a few minutes.
+                    </p>
+                  )}
+                  {video?.status === "failed" && (
+                    <p className="pipeline-error">{video.error || "Render failed"}</p>
+                  )}
+                  {(isReady || video?.status === "approved" || video?.status === "rejected") && videoUrl && (
+                    <div className="preview-block">
+                      {thumbUrl && <img className="thumb" src={thumbUrl} alt="Thumbnail" />}
+                      <video className="preview-video" src={videoUrl} controls playsInline poster={thumbUrl || undefined} />
+                      <div className="action-row">
+                        {isReady && (
+                          <>
+                            <button
+                              className="action approve"
+                              disabled={!!actionLoading}
+                              onClick={() => runVideoAction("approve")}
+                            >
+                              {actionLoading === "approve" ? <Loader2 className="spin" size={16} /> : <Check size={16} />}
+                              Approve
+                            </button>
+                            <button
+                              className="action reject"
+                              disabled={!!actionLoading}
+                              onClick={() => runVideoAction("reject")}
+                            >
+                              {actionLoading === "reject" ? <Loader2 className="spin" size={16} /> : <X size={16} />}
+                              Reject
+                            </button>
+                          </>
+                        )}
+                        <button
+                          className="action regenerate"
+                          disabled={!!actionLoading || isBusy}
+                          onClick={() => runVideoAction("render")}
+                        >
+                          {actionLoading === "render" ? <Loader2 className="spin" size={16} /> : <RotateCcw size={16} />}
+                          Regenerate
+                        </button>
+                      </div>
+                      {video?.status === "approved" && (
+                        <p className="pipeline-ok">Approved. YouTube upload comes in the next build.</p>
+                      )}
+                      {video?.status === "rejected" && (
+                        <p className="pipeline-error">Rejected. Regenerate to try again.</p>
+                      )}
+                    </div>
+                  )}
+                </div>
+
                 <div className="scenes">
                   {selected.scenes.map((scene) => (
                     <article className="scene" key={scene.order}>

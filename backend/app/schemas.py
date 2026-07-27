@@ -25,5 +25,29 @@ class VideoScriptResponse(BaseModel):
     scenes: list[Scene]
     status: str
     created_at: datetime
+    video_id: int | None = None
+    video_status: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class VideoJobResponse(BaseModel):
+    id: int
+    script_id: int
+    status: str
+    error: str | None = None
+    voice_path: str | None = None
+    video_path: str | None = None
+    thumbnail_path: str | None = None
+    srt_path: str | None = None
+    duration_seconds: float | None = None
+    created_at: datetime
+    updated_at: datetime
+    title: str | None = None
+    topic: str | None = None
+    description: str | None = None
+    hashtags: list[str] | None = None
+    scenes: list[Scene] | None = None
+    media_base: str | None = None
 
     model_config = {"from_attributes": True}

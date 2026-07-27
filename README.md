@@ -4,13 +4,12 @@ Dockerized MVP for an automated AI video generation platform.
 
 ## Current milestone
 
-- React dashboard for creating video script jobs.
-- FastAPI backend with PostgreSQL persistence.
-- Optional Cursor agent script generation (cloud runtime).
-- Redis and RabbitMQ ready for worker orchestration.
-- Nginx reverse proxy.
-- Portainer for container management.
-- GitHub Actions CI + deploy to Hetzner on `main`.
+- React dashboard: topic → script → automatic video render → preview → Approve / Reject
+- Cursor cloud agent (or mock) for scripts
+- Free/local media pipeline: edge-TTS + Pillow scene images + SRT + FFmpeg 1080×1920 MP4
+- RabbitMQ worker (`worker` service)
+- PostgreSQL, Redis, Nginx, Portainer
+- GitHub Actions CI + deploy to Hetzner on `main`
 
 ## Run on the server
 
@@ -26,47 +25,38 @@ Then open:
 - API health: `http://SERVER_IP/api/health`
 - Portainer: `https://SERVER_IP:9443`
 
-RabbitMQ is internal-only by default. To inspect it later:
+## Flow
 
-```bash
-ssh -L 15672:localhost:15672 root@SERVER_IP
-```
+1. Enter a topic in the dashboard
+2. Backend generates a script (Cursor agent if `CURSOR_API_KEY` is set)
+3. A `videos` job is queued on RabbitMQ
+4. Worker builds narration, scene images, captions, thumbnail, and `final.mp4`
+5. Dashboard polls until status is `ready`, then you Approve / Reject / Regenerate
 
-Then open `http://localhost:15672`.
+Media files are served from `/api/media/{video_id}/final.mp4`.
 
 ## CI / CD
 
-- **CI** (`.github/workflows/ci.yml`): validates Compose, compiles the backend, builds the frontend on every PR and push to `main`.
-- **Deploy** (`.github/workflows/deploy.yml`): SSHs into the Hetzner server and runs `scripts/deploy.sh` on every push to `main` (or via workflow dispatch).
+- **CI**: validates Compose, compiles backend, builds frontend on PRs
+- **Deploy**: SSH deploy via `scripts/deploy.sh` on push to `main`
 
-### Required GitHub secrets
-
-| Secret | Value |
-|--------|--------|
-| `DEPLOY_HOST` | Server IP (e.g. `2.28.0.8`) |
-| `DEPLOY_USER` | SSH user (e.g. `root`) |
-| `DEPLOY_SSH_KEY` | Private key used only for deploys |
-
-Manual deploy on the server:
-
-```bash
-cd /opt/ai-content-factory
-bash scripts/deploy.sh
-```
+Secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`
 
 ## Enable Cursor agent generation
 
-Create an API key at [Cursor Dashboard → Integrations](https://cursor.com/dashboard/integrations), then edit `.env`:
-
 ```env
-CURSOR_API_KEY=cursor_...
+CURSOR_API_KEY=crsr_...
 CURSOR_MODEL=composer-2.5
 ```
-
-Restart the backend:
 
 ```bash
 docker compose up -d --build backend
 ```
 
-Without a key, the API falls back to a local mock script so the dashboard still works.
+Without a key, scripts use a local mock so the pipeline still runs.
+
+## Optional voice override
+
+```env
+EDGE_TTS_VOICE=en-US-JennyNeural
+```
