@@ -4,13 +4,15 @@ import asyncio
 import logging
 import subprocess
 import textwrap
+import urllib.parse
+from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
 
 import edge_tts
 import httpx
 from openai import OpenAI
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 
 from config import settings, video_dir
 
@@ -18,6 +20,37 @@ logger = logging.getLogger(__name__)
 
 WIDTH = 1080
 HEIGHT = 1920
+
+
+@dataclass
+class OpenAIGate:
+    """Skip further OpenAI calls after the first quota/billing failure in a job."""
+
+    disabled: bool = False
+    reason: str = ""
+    failures: list[str] = field(default_factory=list)
+
+    def note_failure(self, exc: Exception) -> None:
+        message = str(exc)
+        self.failures.append(message[:300])
+        lowered = message.lower()
+        if any(
+            token in lowered
+            for token in (
+                "insufficient_quota",
+                "exceeded your current quota",
+                "billing",
+                "rate_limit",
+                "429",
+            )
+        ):
+            self.disabled = True
+            self.reason = message[:240]
+            logger.warning("OpenAI disabled for remainder of this job: %s", self.reason)
+
+    @property
+    def enabled(self) -> bool:
+        return bool(settings.openai_api_key) and not self.disabled
 
 
 def _openai_client() -> OpenAI | None:
@@ -60,6 +93,16 @@ def _probe_duration(path: Path) -> float:
         text=True,
     )
     return float(result.stdout.strip())
+
+
+def _fit_cover(image: Image.Image, width: int, height: int) -> Image.Image:
+    image = image.convert("RGB")
+    src_w, src_h = image.size
+    scale = max(width / src_w, height / src_h)
+    resized = image.resize((max(1, int(src_w * scale)), max(1, int(src_h * scale))), Image.Resampling.LANCZOS)
+    left = (resized.width - width) // 2
+    top = (resized.height - height) // 2
+    return resized.crop((left, top, left + width, top + height))
 
 
 def _synthesize_with_openai(text: str, output: Path) -> None:
@@ -108,12 +151,13 @@ def _synthesize_with_espeak(text: str, output: Path) -> None:
     wav_path.unlink(missing_ok=True)
 
 
-async def _synthesize_scene(text: str, output: Path, edge_voice: str) -> None:
-    if settings.openai_api_key:
+async def _synthesize_scene(text: str, output: Path, edge_voice: str, gate: OpenAIGate) -> None:
+    if gate.enabled:
         try:
             await asyncio.to_thread(_synthesize_with_openai, text, output)
             return
         except Exception as exc:
+            gate.note_failure(exc)
             logger.warning("OpenAI TTS failed (%s); trying edge-tts", exc)
 
     try:
@@ -136,72 +180,133 @@ def _pick_edge_voice(language: str | None = None) -> str:
     return settings.edge_tts_voice
 
 
-def _generate_pillow_scene(prompt: str, title: str, order: int, output: Path) -> None:
-    top = (16, 48, 41)
-    bottom = (46, 194, 142)
-    image = Image.new("RGB", (WIDTH, HEIGHT), top)
-    draw = ImageDraw.Draw(image)
-    for y in range(HEIGHT):
-        ratio = y / (HEIGHT - 1)
-        color = tuple(int(top[i] * (1 - ratio) + bottom[i] * ratio) for i in range(3))
-        draw.line([(0, y), (WIDTH, y)], fill=color)
-
-    draw.rounded_rectangle((72, 120, WIDTH - 72, 220), radius=28, fill=(12, 35, 28))
-    draw.text((110, 145), f"SCENE {order:02d}", fill=(93, 224, 166), font=_font(42))
-
-    wrapped_title = textwrap.fill(title[:80], width=22)
-    draw.multiline_text((96, 280), wrapped_title, fill=(247, 251, 248), font=_font(64), spacing=12)
-
-    draw.rounded_rectangle((72, 720, WIDTH - 72, 1500), radius=36, fill=(15, 35, 29))
-    wrapped_prompt = textwrap.fill(prompt[:280], width=28)
-    draw.multiline_text((110, 760), wrapped_prompt, fill=(236, 248, 242), font=_font(44), spacing=10)
-    draw.text((96, HEIGHT - 160), "AI Content Factory", fill=(204, 224, 215), font=_font(36))
-    image.save(output, format="PNG")
+def _download_image(url: str) -> Image.Image:
+    response = httpx.get(url, timeout=120.0, follow_redirects=True)
+    response.raise_for_status()
+    return Image.open(BytesIO(response.content)).convert("RGB")
 
 
-def _generate_openai_scene(prompt: str, title: str, output: Path) -> None:
+def _generate_openai_scene(prompt: str, title: str) -> Image.Image:
     client = _openai_client()
     if client is None:
         raise RuntimeError("OPENAI_API_KEY is not configured")
 
     full_prompt = (
-        "Create a vertical 9:16 cinematic still for a YouTube Shorts / TikTok fact video. "
-        "Photoreal or high-end illustrated style, dramatic lighting, no text, no watermark, "
-        "no logos, no UI chrome. "
-        f"Video title context: {title}. "
-        f"Scene: {prompt}"
+        "Vertical 9:16 cinematic still for a YouTube Short. Photoreal or premium illustrated look, "
+        "dramatic lighting, rich detail, NO text, NO watermark, NO logos, NO UI. "
+        f"Title context: {title}. Scene: {prompt}"
     )[:3900]
 
-    result = client.images.generate(
-        model=settings.openai_image_model,
-        prompt=full_prompt,
-        size="1024x1792",
-        quality="standard",
-        n=1,
-    )
-    item = result.data[0]
-    if getattr(item, "b64_json", None):
-        raw = BytesIO(__import__("base64").b64decode(item.b64_json))
-        image = Image.open(raw).convert("RGB")
-    elif getattr(item, "url", None):
-        response = httpx.get(item.url, timeout=120.0)
-        response.raise_for_status()
-        image = Image.open(BytesIO(response.content)).convert("RGB")
-    else:
-        raise RuntimeError("OpenAI image response missing url/b64_json")
+    # Prefer modern image model, then older variants that some accounts still have.
+    model_attempts: list[tuple[str, dict]] = [
+        (
+            settings.openai_image_model,
+            {"prompt": full_prompt, "size": "1024x1792", "n": 1},
+        ),
+        (
+            "gpt-image-1",
+            {"prompt": full_prompt, "size": "1024x1536", "n": 1},
+        ),
+        (
+            "dall-e-2",
+            {"prompt": full_prompt[:1000], "size": "1024x1024", "n": 1},
+        ),
+    ]
 
-    image = image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS)
-    image.save(output, format="PNG")
-
-
-def generate_scene_image(prompt: str, title: str, order: int, output: Path) -> None:
-    if settings.openai_api_key:
+    last_error: Exception | None = None
+    for model, kwargs in model_attempts:
         try:
-            _generate_openai_scene(prompt, title, output)
-            return
+            params = {"model": model, **kwargs}
+            if model.startswith("dall-e-3"):
+                params["quality"] = "standard"
+                params["size"] = "1024x1792"
+            result = client.images.generate(**params)
+            item = result.data[0]
+            if getattr(item, "b64_json", None):
+                image = Image.open(BytesIO(__import__("base64").b64decode(item.b64_json))).convert("RGB")
+            elif getattr(item, "url", None):
+                image = _download_image(item.url)
+            else:
+                raise RuntimeError("OpenAI image response missing url/b64_json")
+            return _fit_cover(image, WIDTH, HEIGHT)
         except Exception as exc:
-            logger.warning("OpenAI image failed for scene %s (%s); using Pillow fallback", order, exc)
-    _generate_pillow_scene(prompt, title, order, output)
+            last_error = exc
+            logger.warning("OpenAI image model %s failed: %s", model, exc)
+            continue
+    raise RuntimeError(str(last_error) if last_error else "OpenAI image generation failed")
+
+
+def _generate_pollinations_scene(prompt: str, title: str) -> Image.Image:
+    # Free image endpoint used when OpenAI images are unavailable.
+    query = urllib.parse.quote(
+        f"{prompt}, cinematic vertical composition, dramatic lighting, no text, no watermark, {title}"
+    )
+    url = (
+        f"https://image.pollinations.ai/prompt/{query}"
+        f"?width={WIDTH}&height={HEIGHT}&nologo=true&enhance=true"
+    )
+    image = _download_image(url)
+    return _fit_cover(image, WIDTH, HEIGHT)
+
+
+def _generate_pillow_scene(prompt: str, title: str, order: int) -> Image.Image:
+    """Appealing abstract fallback — never dump the full prompt as a wall of text."""
+    palette = [
+        ((12, 24, 48), (34, 120, 180), (240, 180, 90)),
+        ((20, 10, 40), (120, 40, 140), (40, 200, 180)),
+        ((8, 40, 30), (20, 120, 90), (220, 220, 120)),
+        ((30, 10, 20), (160, 40, 70), (240, 160, 80)),
+    ]
+    c1, c2, accent = palette[(order - 1) % len(palette)]
+    image = Image.new("RGBA", (WIDTH, HEIGHT), (*c1, 255))
+    draw = ImageDraw.Draw(image)
+    for y in range(HEIGHT):
+        ratio = y / (HEIGHT - 1)
+        color = tuple(int(c1[i] * (1 - ratio) + c2[i] * ratio) for i in range(3)) + (255,)
+        draw.line([(0, y), (WIDTH, y)], fill=color)
+
+    for idx, offset in enumerate((0, 180, 360)):
+        bbox = (80 + offset // 2, 420 + offset, WIDTH - 80 - offset // 3, 980 + offset // 2)
+        draw.ellipse(bbox, fill=(*accent, 45 + idx * 18))
+
+    image = image.filter(ImageFilter.GaussianBlur(radius=0.8))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((64, 120, WIDTH - 64, 250), radius=28, fill=(0, 0, 0, 150))
+    draw.text((96, 155), f"SCENE {order:02d}", fill=(*accent, 255), font=_font(44))
+
+    short_title = textwrap.fill(title[:48], width=18)
+    draw.multiline_text((96, 300), short_title, fill=(250, 250, 250, 255), font=_font(58), spacing=10)
+
+    hint = textwrap.fill((prompt or title)[:70], width=28)
+    draw.rounded_rectangle((64, HEIGHT - 320, WIDTH - 64, HEIGHT - 140), radius=24, fill=(0, 0, 0, 130))
+    draw.multiline_text((96, HEIGHT - 280), hint, fill=(230, 230, 230, 255), font=_font(32), spacing=6)
+    return image.convert("RGB")
+
+
+def generate_scene_image(prompt: str, title: str, order: int, output: Path, gate: OpenAIGate) -> None:
+    image: Image.Image | None = None
+
+    if gate.enabled:
+        try:
+            image = _generate_openai_scene(prompt, title)
+            logger.info("Scene %s image source=openai", order)
+        except Exception as exc:
+            gate.note_failure(exc)
+            logger.warning("OpenAI image failed for scene %s (%s)", order, exc)
+
+    if image is None:
+        try:
+            image = _generate_pollinations_scene(prompt, title)
+            logger.info("Scene %s image source=pollinations", order)
+        except Exception as exc:
+            logger.warning("Pollinations image failed for scene %s (%s); using styled fallback", order, exc)
+            image = _generate_pillow_scene(prompt, title, order)
+            logger.info("Scene %s image source=pillow", order)
+
+    # Mild contrast boost so frames feel less flat on phone screens.
+    image = ImageEnhance.Contrast(image).enhance(1.08)
+    image = ImageEnhance.Color(image).enhance(1.06)
+    image.save(output, format="PNG")
 
 
 def write_srt(scenes: list[dict], durations: list[float], output: Path) -> None:
@@ -210,9 +315,12 @@ def write_srt(scenes: list[dict], durations: list[float], output: Path) -> None:
     for index, (scene, duration) in enumerate(zip(scenes, durations), start=1):
         start = cursor
         end = cursor + duration
+        narration = " ".join((scene.get("narration") or "").split())
+        # Keep captions short so they don't cover the visuals.
+        wrapped = textwrap.fill(narration, width=32)
         lines.append(str(index))
         lines.append(f"{_ts(start)} --> {_ts(end)}")
-        lines.append(scene.get("narration", "").strip())
+        lines.append(wrapped)
         lines.append("")
         cursor = end
     output.write_text("\n".join(lines), encoding="utf-8")
@@ -248,6 +356,8 @@ def render_video(
 
     for index, (image, duration) in enumerate(zip(scene_images, durations), start=1):
         segment = work / f"seg_{index:03d}.mp4"
+        # Gentle Ken Burns zoom so still images feel more like video.
+        frames = max(int(duration * 30), 45)
         _run_ffmpeg(
             [
                 "ffmpeg",
@@ -257,12 +367,14 @@ def render_video(
                 "-i",
                 str(image),
                 "-vf",
-                f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
-                f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+                (
+                    f"scale=1200:2133,"
+                    f"zoompan=z='min(zoom+0.0006,1.08)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+                    f":d={frames}:s={WIDTH}x{HEIGHT}:fps=30,"
+                    f"format=yuv420p"
+                ),
                 "-t",
                 f"{max(duration, 1.5):.3f}",
-                "-r",
-                "30",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -298,6 +410,7 @@ def render_video(
     )
 
     srt_abs = srt_path.resolve().as_posix().replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    # Thin outline captions at the bottom — no opaque black boxes covering the frame.
     _run_ffmpeg(
         [
             "ffmpeg",
@@ -309,8 +422,8 @@ def render_video(
             "-vf",
             (
                 f"subtitles={srt_abs}:"
-                "force_style='FontName=DejaVu Sans,Fontsize=18,PrimaryColour=&H00FFFFFF&,"
-                "OutlineColour=&H0010231D&,BorderStyle=3,Outline=2,Shadow=0,Alignment=2,MarginV=90'"
+                "force_style='FontName=DejaVu Sans,Fontsize=14,PrimaryColour=&H00FFFFFF&,"
+                "OutlineColour=&H80000000&,BorderStyle=1,Outline=2,Shadow=0,Alignment=2,MarginV=120'"
             ),
             "-c:v",
             "libx264",
@@ -333,6 +446,7 @@ def render_video(
 async def build_video_assets(video_id: int, title: str, scenes: list[dict], language: str | None = None) -> dict:
     out_dir = video_dir(video_id)
     edge_voice = _pick_edge_voice(language)
+    gate = OpenAIGate()
     ordered = sorted(scenes, key=lambda item: int(item.get("order", 0)))
     if not ordered:
         raise RuntimeError("Script has no scenes")
@@ -351,10 +465,10 @@ async def build_video_assets(video_id: int, title: str, scenes: list[dict], lang
         audio_path = out_dir / f"scene_{order:03d}.mp3"
         image_path = out_dir / f"scene_{order:03d}.png"
         logger.info("TTS scene %s", order)
-        await _synthesize_scene(narration, audio_path, edge_voice)
+        await _synthesize_scene(narration, audio_path, edge_voice, gate)
         duration = max(_probe_duration(audio_path), 1.5)
         logger.info("Image scene %s", order)
-        await asyncio.to_thread(generate_scene_image, prompt, title, order, image_path)
+        await asyncio.to_thread(generate_scene_image, prompt, title, order, image_path, gate)
         scene_audio_paths.append(audio_path)
         durations.append(duration)
         scene_images.append(image_path)

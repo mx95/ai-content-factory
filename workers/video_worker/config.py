@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_tts_model: str = "tts-1-hd"
     openai_tts_voice: str = "nova"
-    openai_image_model: str = "dall-e-3"
+    openai_image_model: str = "gpt-image-1"
     edge_tts_voice: str = "en-US-JennyNeural"
     app_public_url: str = "http://2.28.0.8"
     notify_email_to: str = ""
