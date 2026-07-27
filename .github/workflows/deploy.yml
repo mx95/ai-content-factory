@@ -60,9 +60,11 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          script_stop: true
           command_timeout: 15m
           script: |
             set -euo pipefail
             cd /opt/ai-content-factory
+            git fetch --prune origin main
+            git checkout main
+            git reset --hard origin/main
             bash scripts/deploy.sh
